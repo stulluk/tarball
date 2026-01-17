@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  tarball [--zstd|--pigz] DIRECTORY
+  tarball -d [--zstd|--pigz] TAR-FILE
+
+Options:
+  -d, --decompress   Extract tarball
+      --zstd         Use zstd for compress/decompress
+      --pigz         Use pigz for compress/decompress
+  -h, --help         Show this message
+
+Notes:
+  - Default algorithm: zstd if available, otherwise pigz, otherwise gzip.
+  - Output file is written to the current working directory.
+EOF
+}
+
+err() {
+  echo "tarball: $*" >&2
+  exit 1
+}
+
+mode="compress"
+algo=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--decompress)
+      mode="decompress"
+      shift
+      ;;
+    --zstd)
+      algo="zstd"
+      shift
+      ;;
+    --pigz)
+      algo="pigz"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      err "Unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+threads() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  else
+    echo 4
+  fi
+}
+
+have_pv() {
+  command -v pv >/dev/null 2>&1
+}
+
+source_size_bytes() {
+  local dir="$1"
+  if command -v gdu >/dev/null 2>&1; then
+    gdu -n -p --no-prefix --show-apparent-size "$dir" | awk 'NR==1 {print $1}'
+  else
+    du -sb "$dir" | awk '{print $1}'
+  fi
+}
+
+pick_default_algo() {
+  if command -v zstd >/dev/null 2>&1; then
+    echo "zstd"
+  elif command -v pigz >/dev/null 2>&1; then
+    echo "pigz"
+  else
+    echo "gzip"
+  fi
+}
+
+if [[ "$mode" == "compress" ]]; then
+  dir="${1:-}"
+  [[ -n "$dir" ]] || err "Directory is required."
+  [[ -d "$dir" ]] || err "Directory not found: $dir"
+
+  algo="${algo:-$(pick_default_algo)}"
+  base="$(basename "$dir")"
+  parent="$(cd "$(dirname "$dir")" && pwd -P)"
+
+  case "$algo" in
+    zstd)
+      out="${base}.tar.zst"
+      if have_pv; then
+        size_bytes="$(source_size_bytes "$dir")"
+        tar -C "$parent" -cf - "$base" | pv -s "$size_bytes" -pterb | zstd -T0 -q > "$out"
+      else
+        tar --checkpoint=1000 --checkpoint-action=dot -C "$parent" -cf - "$base" \
+          | zstd -T0 -q > "$out"
+      fi
+      ;;
+    pigz)
+      out="${base}.tar.gz"
+      if have_pv; then
+        size_bytes="$(source_size_bytes "$dir")"
+        tar -C "$parent" -cf - "$base" | pv -s "$size_bytes" -pterb | pigz -p "$(threads)" > "$out"
+      else
+        tar --checkpoint=1000 --checkpoint-action=dot -C "$parent" -cf - "$base" \
+          | pigz -p "$(threads)" > "$out"
+      fi
+      ;;
+    gzip)
+      out="${base}.tar.gz"
+      if have_pv; then
+        size_bytes="$(source_size_bytes "$dir")"
+        tar -C "$parent" -cf - "$base" | pv -s "$size_bytes" -pterb | gzip -n > "$out"
+      else
+        tar --checkpoint=1000 --checkpoint-action=dot -C "$parent" -cf - "$base" \
+          | gzip -n > "$out"
+      fi
+      ;;
+    *)
+      err "Unsupported algorithm: $algo"
+      ;;
+  esac
+
+  echo "Created: $out"
+else
+  file="${1:-}"
+  [[ -n "$file" ]] || err "Tar file is required."
+  [[ -f "$file" ]] || err "File not found: $file"
+
+  if [[ -z "$algo" ]]; then
+    case "$file" in
+      *.tar.zst|*.tzst|*.zst) algo="zstd" ;;
+      *.tar.gz|*.tgz|*.gz)
+        if command -v pigz >/dev/null 2>&1; then
+          algo="pigz"
+        else
+          algo="gzip"
+        fi
+        ;;
+      *) err "Cannot detect algorithm. Use --zstd or --pigz." ;;
+    esac
+  fi
+
+  case "$algo" in
+    zstd)
+      if have_pv; then
+        size_bytes="$(stat -c %s "$file")"
+        pv -s "$size_bytes" -pterb "$file" | zstd -d -T0 -q | tar -xf -
+      else
+        tar --checkpoint=1000 --checkpoint-action=dot \
+          --use-compress-program="zstd -d -T0 -q" -xf "$file"
+      fi
+      ;;
+    pigz)
+      if have_pv; then
+        size_bytes="$(stat -c %s "$file")"
+        pv -s "$size_bytes" -pterb "$file" | pigz -d -p "$(threads)" | tar -xf -
+      else
+        tar --checkpoint=1000 --checkpoint-action=dot \
+          --use-compress-program="pigz -d -p $(threads)" -xf "$file"
+      fi
+      ;;
+    gzip)
+      if have_pv; then
+        size_bytes="$(stat -c %s "$file")"
+        pv -s "$size_bytes" -pterb "$file" | gzip -d | tar -xf -
+      else
+        tar --checkpoint=1000 --checkpoint-action=dot -xzf "$file"
+      fi
+      ;;
+    *)
+      err "Unsupported algorithm: $algo"
+      ;;
+  esac
+
+  echo "Extracted: $file"
+fi
